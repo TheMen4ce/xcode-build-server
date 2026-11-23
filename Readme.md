@@ -95,6 +95,11 @@ after this, the compile info should auto generate when xcode builds and no need 
 [sourcekit-lsp](https://github.com/apple/sourcekit-lsp#indexing-while-building) uses indexing while building.
 If you find that find definitions or references are not working correctly, just build it to update index
 
+The index store keeps one unit per source file and destination, e.g. one from the last device and one from the last simulator build of a file.
+So that sourcekit-lsp doesn't merge outdated units into its results (a second definition, or one on a wrong line), xcode-build-server reports the
+most recently written unit of each source file as its output path, which makes sourcekit-lsp ignore the others. This needs the toolchain's
+`libIndexStore.dylib`; without it sourcekit-lsp uses all units as before.
+
 # More
 
 Current implementation is basicly working, but may have some rough edges. Please report issue if you have any problem. If you want to help, you can check the open issue list. PR's are always welcome.

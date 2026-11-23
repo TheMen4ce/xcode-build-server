@@ -17,9 +17,14 @@ from compile_database import (
     newfileForCompileFile,
 )
 from config import ServerConfig, env
+from index_store import IndexStore
 from misc import force_remove, get_mtime, VERSION, version_compare
 
 logger = logging.getLogger(__name__)
+
+# seconds the index store must stay unchanged before it is rescanned,
+# so that a build or Xcode's background indexing triggers one rescan instead of one per second
+INDEX_STORE_QUIET_TIME = 2
 
 
 def send(data):
@@ -76,6 +81,12 @@ class State(object):
 
         # {path: mtime} cache. use to find changes
         self.observed_info = {self.config.path: get_mtime(self.config.path)}
+
+        # set by open_index_store when sourcekit-lsp gets output paths. see index_store.py
+        self.index_store: Optional[IndexStore] = None
+        self.observed_index_store_mtime = 0
+        # {source file: output path of its current unit}
+        self.output_paths: dict[str, str] = {}
 
         self.reinit_compile_info()
         # NOTE:thread-safety: for state shared by main and background watch thread,
@@ -255,6 +266,8 @@ class State(object):
             return
         if self.handle_compile_file_change():
             return
+        if self.handle_index_store_change():
+            return
         if self.config.kind != "xcode":
             return
         if self.check_locking_compile_file():
@@ -284,6 +297,31 @@ class State(object):
         if compile_file_mtime > self.observed_info.get(self._compile_file, 0):
             self.sync_compile_file()
             return True
+
+    def open_index_store(self, path) -> bool:
+        """return whether the output paths of the index store can be provided"""
+        self.index_store = IndexStore.open(path) if self.new_version else None
+        return self.index_store is not None
+
+    def handle_index_store_change(self):
+        """rescan the index store after it changed, return True if the output paths changed"""
+        if not self.index_store:
+            return False
+        mtime = self.index_store.mtime
+        if mtime == self.observed_index_store_mtime:
+            return False
+        # the first scan doesn't wait, since sourcekit-lsp uses no unit at all until it gets output paths
+        if self.observed_index_store_mtime and time.time() - mtime < INDEX_STORE_QUIET_TIME:
+            return False
+        self.observed_index_store_mtime = mtime
+
+        output_paths = self.index_store.output_paths()
+        if output_paths == self.output_paths:
+            return False
+        with mainlock:
+            self.output_paths = output_paths
+            self.notify_target_changes()
+        return True
 
     def check_locking_compile_file(self):
         if self.locking_compile_file:
@@ -426,6 +464,7 @@ def server_api():
                 "data": {
                     "indexDatabasePath": indexDatabasePath,
                     "indexStorePath": indexStorePath,
+                    "outputPathsProvider": state.open_index_store(indexStorePath),
                     "sourceKitOptionsProvider": True,
                 },
                 "dataKind": "sourceKit",
@@ -496,6 +535,18 @@ def server_api():
                             "generated": False,
                         }
                     )
+                # sourcekit-lsp only uses the units whose output path is listed here
+                sources.extend(
+                    {
+                        "uri": Path(file).as_uri(),
+                        "kind": 1,
+                        "generated": False,
+                        "dataKind": "sourceKit",
+                        "data": {"outputPath": output_path},
+                    }
+                    for file, output_path in shared_state.output_paths.items()
+                    if os.path.isabs(file)
+                )
                 items.append(
                     {
                         "target": target,
@@ -525,7 +576,6 @@ def server_api():
             "result": shared_state.sourceKitOptions(uri),
         }
 
-    # TODO: outputPaths, no spec? #
     def build_shutdown(message):
         shared_state.shutdown()
         return {"jsonrpc": "2.0", "id": message["id"], "result": None}
